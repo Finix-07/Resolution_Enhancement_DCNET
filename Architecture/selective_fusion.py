@@ -1,113 +1,89 @@
-# selective_fusion.py
+# selective_fusion_module.py
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
-class CNNBranch(nn.Module):
-    def __init__(self, dim: int, bias: bool = False):
+class SFT(nn.Module):
+    """
+    Spatial Feature Transform (SFT) module that, given dissimilar features X,
+    produces modulation parameters γ and β via a small conv‐ReLU‐conv.
+    (Eq. 17) :contentReference[oaicite:4]{index=4}
+    """
+    def __init__(self, channels: int, bias: bool = False):
         super().__init__()
-        self.local = nn.Sequential(
-            nn.Conv2d(dim, dim, kernel_size=3, padding=1, bias=bias),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(dim, dim, kernel_size=3, padding=1, bias=bias)
-        )
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=1, bias=bias)
+        self.relu  = nn.ReLU(inplace=True)
+        # produce 2×channels: γ and β
+        self.conv2 = nn.Conv2d(channels, channels * 2, kernel_size=1, bias=bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.local(x)
+    def forward(self, x: torch.Tensor):
+        y = self.conv1(x)
+        y = self.relu(y)
+        y = self.conv2(y)
+        gamma, beta = y.chunk(2, dim=1)
+        return gamma, beta
 
 
-class TransformerBranch(nn.Module):
-    def __init__(self,
-                 dim: int,
-                 num_heads: int = 8,
-                 mlp_ratio: float = 4.0,
-                 bias: bool = False):
+class SelectiveFusionModule(nn.Module):
+    """
+    SFM: given two feature maps from Transformer (X_trans) and CNN (X_cnn),
+    1) compute cosine similarities at spatial (Ms) and channel (Mc) levels,
+       then build M = sigmoid(Mc)^T * sigmoid(Ms) reshaped to (C,H,W) :contentReference[oaicite:5]{index=5}
+    2) split into similar (X * M) vs dissimilar (X * (1−M))
+    3) Fsim = concat(Xsim_trans, Xsim_cnn)             (Eq. 16)
+    4) Fdis  = concat( Xdis_trans⋅γ_cnn+β_cnn,
+                       Xdis_cnn⋅γ_trans+β_trans )      (Eqs. 17–18)
+    5) Output = Conv1×1(Fsim + Fdis)                   (Eq. 19)
+    """
+    def __init__(self, channels: int, bias: bool = False):
         super().__init__()
-        # Positional embedding (broadcast over tokens)
-        self.pos_emb = nn.Parameter(torch.zeros(1, 1, dim))
+        self.sft  = SFT(channels, bias=bias)
+        self.conv = nn.Conv2d(channels * 2, channels, kernel_size=1, bias=bias)
 
-        # Project to QKV via a 1×1 conv
-        self.qkv_conv = nn.Conv2d(dim, dim * 3, kernel_size=1, bias=bias)
+    def forward(self, x_trans: torch.Tensor, x_cnn: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x_trans.size()
+        N = H * W
+        eps = 1e-8
 
-        # Pre-norm for attention
-        self.norm1 = nn.LayerNorm(dim)
-        # Multi-head self-attention
-        self.attn = nn.MultiheadAttention(
-            embed_dim=dim,
-            num_heads=num_heads,
-            bias=bias,
-            batch_first=True
-        )
+        # flatten for similarity computations
+        t_flat = x_trans.view(B, C, N)   # (B, C, L)
+        c_flat = x_cnn.view(B, C, N)     # (B, C, L)
 
-        # Pre-norm for MLP
-        self.norm2 = nn.LayerNorm(dim)
-        hidden_dim = int(dim * mlp_ratio)
-        # Feed-forward network
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, hidden_dim, bias=bias),
-            nn.GELU(),
-            nn.Linear(hidden_dim, dim, bias=bias)
-        )
+        # 1) Spatial similarity Ms ∈ R^{B×L}: cosine across channel dimension
+        t_norm  = F.normalize(t_flat, dim=1, eps=eps)
+        c_norm  = F.normalize(c_flat, dim=1, eps=eps)
+        Ms      = torch.sum(t_norm * c_norm, dim=1)          # (B, L)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
-        # 1) QKV projection + reshape to (B, N, C)
-        qkv = self.qkv_conv(x)               # (B, 3C, H, W)
-        qkv = qkv.view(B, 3, C, H * W)       # (B, 3, C, N)
-        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
-        # (B, N, C)
-        q, k, v = [t.transpose(1, 2) for t in (q, k, v)]
+        # 2) Channel similarity Mc ∈ R^{B×C}: cosine across spatial dimension
+        t_spat  = F.normalize(t_flat, dim=2, eps=eps)
+        c_spat  = F.normalize(c_flat, dim=2, eps=eps)
+        Mc      = torch.sum(t_spat * c_spat, dim=2)          # (B, C)
 
-        # 2) Add positional embedding
-        q = q + self.pos_emb
+        # 3) Feature selection matrix M: outer product, reshape to (B, C, H, W)
+        Mc_s    = torch.sigmoid(Mc).unsqueeze(2)             # (B, C, 1)
+        Ms_s    = torch.sigmoid(Ms).unsqueeze(1)             # (B, 1, L)
+        M_flat  = Mc_s * Ms_s                                # (B, C, L)
+        M_map   = M_flat.view(B, C, H, W)                    # (B, C, H, W)
 
-        # 3) MHSA with pre-norm + residual
-        y = self.norm1(q)
-        attn_out, _ = self.attn(y, y, y)
-        x2 = q + attn_out
+        # 4) Split into similar vs dissimilar
+        Xsim_t  = x_trans * M_map
+        Xsim_c  = x_cnn   * M_map
+        Xdis_t  = x_trans * (1 - M_map)
+        Xdis_c  = x_cnn   * (1 - M_map)
 
-        # 4) MLP with pre-norm + residual
-        y2 = self.norm2(x2)
-        y2 = self.mlp(y2)
-        out = x2 + y2
+        # 5) Similar content fusion
+        Fsim    = torch.cat([Xsim_t, Xsim_c], dim=1)         # (B, 2C, H, W)
 
-        # 5) Reshape back to (B, C, H, W)
-        return out.transpose(1, 2).view(B, C, H, W)
+        # 6) Dissimilar content: SFT modulation
+        γ_c, β_c = self.sft(Xdis_c)  # params from CNN branch
+        Xp_t     = Xdis_t * γ_c + β_c
+        γ_t, β_t = self.sft(Xdis_t)  # params from Transformer branch
+        Xp_c     = Xdis_c * γ_t + β_t
+        Fdis     = torch.cat([Xp_t, Xp_c], dim=1)             # (B, 2C, H, W)
 
-
-class SelectiveFusionBlock(nn.Module):
-    def __init__(self,
-                 dim: int,
-                 num_heads: int,
-                 mlp_ratio: float = 4.0,
-                 fusion_type: str = "conv",
-                 bias: bool = False):
-        super().__init__()
-        self.cnn_branch = CNNBranch(dim, bias=bias)
-        self.transformer_branch = TransformerBranch(
-            dim,
-            num_heads=num_heads,
-            mlp_ratio=mlp_ratio,
-            bias=bias
-        )
-        self.fusion_type = fusion_type
-
-        if fusion_type == "conv":
-            self.fusion = nn.Sequential(
-                nn.Conv2d(dim * 2, dim, kernel_size=1, bias=bias),
-                nn.ReLU(inplace=True)
-            )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_local  = self.cnn_branch(x)
-        x_global = self.transformer_branch(x)
-
-        if self.fusion_type == "add":
-            return x_local + x_global
-        elif self.fusion_type == "concat":
-            return torch.cat([x_local, x_global], dim=1)
-        elif self.fusion_type == "conv":
-            return self.fusion(torch.cat([x_local, x_global], dim=1))
-        else:
-            raise ValueError(f"Unknown fusion type: {self.fusion_type}")
+        # 7) Merge and reduce channels
+        out = Fsim + Fdis                                    # (B, 2C, H, W)
+        out = self.conv(out)                                 # (B, C, H, W)
+        return out
