@@ -9,6 +9,7 @@ from datetime import datetime
 import numpy as np
 import matplotlib.pyplot as plt
 from skimage.metrics import structural_similarity as sk_ssim
+from tqdm import tqdm
 
 def compute_psnr(sr: torch.Tensor, hr: torch.Tensor) -> float:
     mse = F.mse_loss(sr, hr, reduction='mean').item()
@@ -16,12 +17,102 @@ def compute_psnr(sr: torch.Tensor, hr: torch.Tensor) -> float:
         return float('inf')
     return 10 * np.log10((1.0 ** 2) / mse)
 
+# def compute_ssim(sr: torch.Tensor, hr: torch.Tensor) -> float:
+#     sr_ = sr.squeeze().cpu().numpy()
+#     print(sr_.shape)
+#     hr_ = hr.squeeze().cpu().numpy()
+#     print(hr_.shape)
+#     # sr_np = sr_.transpose(1, 2, 0)
+#     # hr_np = hr_.transpose(1, 2, 0)
+
+#     # sr_np = sr_.transpose(1,2,0)
+#     # hr_np = hr_.transpose(1,2,0)
+#     sr_np = np.expand_dims(sr.cpu().numpy(), axis=-1) 
+#     hr_np = np.expand_dims(hr.cpu().numpy(), axis=-1)
+    
+#     # Compute SSIM on each channel and average
+#     ssim_vals = [sk_ssim(hr_np[..., c], sr_np[..., c], data_range=1.0) for c in range(hr_np.shape[2])]
+#     return float(np.mean(ssim_vals))
+
 def compute_ssim(sr: torch.Tensor, hr: torch.Tensor) -> float:
-    sr_np = sr.squeeze().cpu().numpy().transpose(1, 2, 0)
-    hr_np = hr.squeeze().cpu().numpy().transpose(1, 2, 0)
-    # Compute SSIM on each channel and average
-    ssim_vals = [sk_ssim(hr_np[..., c], sr_np[..., c], data_range=1.0) for c in range(hr_np.shape[2])]
-    return float(np.mean(ssim_vals))
+    """Compute SSIM between super-resolution and high-resolution images."""
+    # Convert tensors to numpy arrays
+    sr_np = sr.detach().cpu().numpy()
+    hr_np = hr.detach().cpu().numpy()
+    
+    # Fix 1: Print shapes for debugging
+    # print(f"SR shape: {sr_np.shape}, HR shape: {hr_np.shape}")
+    
+    # Fix 2: Find minimum spatial dimension to determine window size
+    if len(sr_np.shape) == 4:  # [B,C,H,W]
+        spatial_dims = sr_np.shape[2:]  # [H,W]
+    elif len(sr_np.shape) == 3:  # [C,H,W]
+        spatial_dims = sr_np.shape[1:]  # [H,W]
+    else:  # [H,W]
+        spatial_dims = sr_np.shape
+    
+    min_dim = min(spatial_dims)
+    
+    # Fix 3: Set appropriate window size (must be odd)
+    if min_dim < 7:
+        win_size = min_dim if min_dim % 2 == 1 else min_dim - 1
+        win_size = max(win_size, 3)  # minimum valid window size is 3
+    else:
+        win_size = 7  # default
+    
+    # Fix 4: Handle grayscale images correctly
+    if len(sr_np.shape) == 4:  # Batched input [B,C,H,W]
+        batch_size = sr_np.shape[0]
+        ssim_vals = []
+        
+        for b in range(batch_size):
+            if sr_np.shape[1] == 1:  # Grayscale
+                s_val = sk_ssim(hr_np[b, 0], sr_np[b, 0], 
+                               data_range=1.0, win_size=win_size)
+            else:  # Multi-channel
+                # Transpose to [H,W,C] format for scikit-image
+                sr_img = np.transpose(sr_np[b], (1, 2, 0))
+                hr_img = np.transpose(hr_np[b], (1, 2, 0))
+                s_val = sk_ssim(hr_img, sr_img, data_range=1.0, 
+                               win_size=win_size, channel_axis=2)
+            ssim_vals.append(s_val)
+        
+        return float(np.mean(ssim_vals))
+        
+    elif len(sr_np.shape) == 3:  # Single image [C,H,W]
+        if sr_np.shape[0] == 1:  # Grayscale
+            return float(sk_ssim(hr_np[0], sr_np[0], 
+                              data_range=1.0, win_size=win_size))
+        else:  # Multi-channel
+            sr_img = np.transpose(sr_np, (1, 2, 0))
+            hr_img = np.transpose(hr_np, (1, 2, 0))
+            return float(sk_ssim(hr_img, sr_img, data_range=1.0, 
+                              win_size=win_size, channel_axis=2))
+    
+    else:  # Single image, single channel [H,W]
+        return float(sk_ssim(hr_np, sr_np, data_range=1.0, win_size=win_size))
+
+# def compute_ssim(sr: torch.Tensor, hr: torch.Tensor) -> float:
+#     sr_ = sr.squeeze().cpu().numpy()
+#     hr_ = hr.squeeze().cpu().numpy()
+
+#     print("SR shape:", sr_.shape)
+#     print("HR shape:", hr_.shape)
+
+#     # If image is grayscale (2D), SSIM can be computed directly
+#     if sr_.ndim == 2 and hr_.ndim == 2:
+#         return float(sk_ssim(hr_, sr_, data_range=1.0))
+
+#     # If image is color (3D, shape: C x H x W), transpose to H x W x C
+#     elif sr_.ndim == 3 and hr_.ndim == 3:
+#         sr_np = sr_.transpose(1, 2, 0)
+#         hr_np = hr_.transpose(1, 2, 0)
+#         # Compute SSIM per channel and average
+#         ssim_vals = [sk_ssim(hr_np[..., c], sr_np[..., c], data_range=1.0) for c in range(hr_np.shape[2])]
+#         return float(np.mean(ssim_vals))
+
+#     else:
+#         raise ValueError(f"Unexpected tensor shapes: SR {sr_.shape}, HR {hr_.shape}")
 
 def compute_rmse(sr: torch.Tensor, hr: torch.Tensor) -> float:
     mse = F.mse_loss(sr, hr, reduction='mean').item()
@@ -52,8 +143,11 @@ def train_loop(model: nn.Module,
 
     for epoch in range(1, num_epochs + 1):
         model.train()
-        for lr_imgs, hr_imgs in train_loader:
-            lr_imgs, hr_imgs = lr_imgs.to(device), hr_imgs.to(device)
+        for batch in train_loader:
+            # Extract 'image' and 'label' from the batch dictionary
+            lr_imgs = batch['image'].to(device)
+            hr_imgs = batch['label'].to(device)
+
             optimizer.zero_grad()
             sr = model(lr_imgs)
             loss = criterion(sr, hr_imgs)
@@ -68,8 +162,9 @@ def train_loop(model: nn.Module,
             epoch_ssim = []
             epoch_rmse = []
             epoch_pcc = []
-            for lr_imgs, hr_imgs in val_loader:
-                lr_imgs, hr_imgs = lr_imgs.to(device), hr_imgs.to(device)
+            for batch in val_loader:
+                lr_imgs = batch['image'].to(device)
+                hr_imgs = batch['label'].to(device)
                 sr = model(lr_imgs)
                 epoch_psnr.append(compute_psnr(sr, hr_imgs))
                 epoch_ssim.append(compute_ssim(sr, hr_imgs))
@@ -122,4 +217,32 @@ def train_loop(model: nn.Module,
     plt.xlabel("Epoch")
     plt.ylabel("PCC")
     plt.savefig(os.path.join(save_dir, "pcc_plot.png"))
+    # Plot and save each metric
+    epochs = np.arange(1, num_epochs + 1)
+    plt.figure()
+    plt.plot(epochs, psnr_list)
+    plt.title("Validation PSNR over Epochs")
+    plt.xlabel("Epoch")
+    plt.ylabel("PSNR")
+    plt.savefig(os.path.join(save_dir, "psnr_plot.png"))
 
+    plt.figure()
+    plt.plot(epochs, ssim_list)
+    plt.title("Validation SSIM over Epochs")
+    plt.xlabel("Epoch")
+    plt.ylabel("SSIM")
+    plt.savefig(os.path.join(save_dir, "ssim_plot.png"))
+
+    plt.figure()
+    plt.plot(epochs, rmse_list)
+    plt.title("Validation RMSE over Epochs")
+    plt.xlabel("Epoch")
+    plt.ylabel("RMSE")
+    plt.savefig(os.path.join(save_dir, "rmse_plot.png"))
+
+    plt.figure()
+    plt.plot(epochs, pcc_list)
+    plt.title("Validation PCC over Epochs")
+    plt.xlabel("Epoch")
+    plt.ylabel("PCC")
+    plt.savefig(os.path.join(save_dir, "pcc_plot.png"))
