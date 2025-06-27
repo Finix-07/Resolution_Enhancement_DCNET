@@ -17,23 +17,6 @@ def compute_psnr(sr: torch.Tensor, hr: torch.Tensor) -> float:
         return float('inf')
     return 10 * np.log10((1.0 ** 2) / mse)
 
-# def compute_ssim(sr: torch.Tensor, hr: torch.Tensor) -> float:
-#     sr_ = sr.squeeze().cpu().numpy()
-#     print(sr_.shape)
-#     hr_ = hr.squeeze().cpu().numpy()
-#     print(hr_.shape)
-#     # sr_np = sr_.transpose(1, 2, 0)
-#     # hr_np = hr_.transpose(1, 2, 0)
-
-#     # sr_np = sr_.transpose(1,2,0)
-#     # hr_np = hr_.transpose(1,2,0)
-#     sr_np = np.expand_dims(sr.cpu().numpy(), axis=-1) 
-#     hr_np = np.expand_dims(hr.cpu().numpy(), axis=-1)
-    
-#     # Compute SSIM on each channel and average
-#     ssim_vals = [sk_ssim(hr_np[..., c], sr_np[..., c], data_range=1.0) for c in range(hr_np.shape[2])]
-#     return float(np.mean(ssim_vals))
-
 def compute_ssim(sr: torch.Tensor, hr: torch.Tensor) -> float:
     """Compute SSIM between super-resolution and high-resolution images."""
     # Convert tensors to numpy arrays
@@ -92,28 +75,6 @@ def compute_ssim(sr: torch.Tensor, hr: torch.Tensor) -> float:
     else:  # Single image, single channel [H,W]
         return float(sk_ssim(hr_np, sr_np, data_range=1.0, win_size=win_size))
 
-# def compute_ssim(sr: torch.Tensor, hr: torch.Tensor) -> float:
-#     sr_ = sr.squeeze().cpu().numpy()
-#     hr_ = hr.squeeze().cpu().numpy()
-
-#     print("SR shape:", sr_.shape)
-#     print("HR shape:", hr_.shape)
-
-#     # If image is grayscale (2D), SSIM can be computed directly
-#     if sr_.ndim == 2 and hr_.ndim == 2:
-#         return float(sk_ssim(hr_, sr_, data_range=1.0))
-
-#     # If image is color (3D, shape: C x H x W), transpose to H x W x C
-#     elif sr_.ndim == 3 and hr_.ndim == 3:
-#         sr_np = sr_.transpose(1, 2, 0)
-#         hr_np = hr_.transpose(1, 2, 0)
-#         # Compute SSIM per channel and average
-#         ssim_vals = [sk_ssim(hr_np[..., c], sr_np[..., c], data_range=1.0) for c in range(hr_np.shape[2])]
-#         return float(np.mean(ssim_vals))
-
-#     else:
-#         raise ValueError(f"Unexpected tensor shapes: SR {sr_.shape}, HR {hr_.shape}")
-
 def compute_rmse(sr: torch.Tensor, hr: torch.Tensor) -> float:
     mse = F.mse_loss(sr, hr, reduction='mean').item()
     return float(np.sqrt(mse))
@@ -122,6 +83,51 @@ def compute_pcc(sr: torch.Tensor, hr: torch.Tensor) -> float:
     sr_flat = sr.cpu().view(-1).numpy()
     hr_flat = hr.cpu().view(-1).numpy()
     return float(np.corrcoef(sr_flat, hr_flat)[0, 1])
+from tqdm import tqdm  # Import tqdm for progress bars
+from torch.cuda.amp import autocast, GradScaler  # Import autocast for mixed precision training
+from kornia.losses import SSIMLoss  # Import SSIM loss from Kornia
+
+class DynamicCompositeLoss(nn.Module):
+    def __init__(self, window_size: int = 11, ssim_weight: float = 5.0, mse_weight: float = 1.0):
+        super().__init__()
+        # Initialize with bias toward SSIM (-1.6 gives exp(-(-1.6)) ≈ 5)
+        self.log_sigma_mse = nn.Parameter(torch.tensor(0.0))
+        self.log_sigma_ssim = nn.Parameter(torch.tensor(-1.6))  # Initial higher weight
+        
+        # Static weights to further control the balance
+        self.ssim_weight = ssim_weight  # Higher weight for SSIM
+        self.mse_weight = mse_weight
+        
+        # Loss functions
+        self.mse_loss = nn.MSELoss()
+        self.ssim_loss = SSIMLoss(window_size=window_size, reduction='mean')
+        
+    def forward(self, sr, hr, epoch=None):
+        L_mse = self.mse_loss(sr, hr)
+        L_ssim = self.ssim_loss(sr, hr)  # returns (1−SSIM)
+        
+        # Dynamic weights with regularization
+        mse_weight = torch.exp(-self.log_sigma_mse) * self.mse_weight
+        ssim_weight = torch.exp(-self.log_sigma_ssim) * self.ssim_weight
+        
+        # Apply progressive weighting if epoch is provided
+        if epoch is not None:
+            # Gradually increase SSIM importance over training
+            epoch_factor = min(1.0 + (epoch / 10), 3.0)  # Cap at 3x boost
+            ssim_weight = ssim_weight * epoch_factor
+        
+        # Composite loss with enhanced SSIM weight
+        loss = (
+            mse_weight * L_mse + self.log_sigma_mse +
+            ssim_weight * L_ssim + self.log_sigma_ssim
+        )
+        
+        # For monitoring weight evolution
+        with torch.no_grad():
+            self.current_mse_weight = mse_weight.item()
+            self.current_ssim_weight = ssim_weight.item()
+            
+        return loss
 
 def train_loop(model: nn.Module,
                train_loader: DataLoader,
@@ -129,11 +135,17 @@ def train_loop(model: nn.Module,
                device: torch.device,
                num_epochs: int = 100):
     # Setup optimizer, scheduler, loss
-    optimizer = Adam(model.parameters(), lr=2e-4, betas=(0.9, 0.999))
+
+    criterion = DynamicCompositeLoss(window_size=11).to(device)
+
+    optimizer = Adam(
+        list(model.parameters()) + list(criterion.parameters()),
+        lr=2e-4, betas=(0.9, 0.999)
+    )
     scheduler = MultiStepLR(optimizer, milestones=[25, 45, 65, 85], gamma=0.5)
-    criterion = nn.L1Loss()
 
     # Prepare metrics storage
+
     psnr_list, ssim_list, rmse_list, pcc_list = [], [], [], []
 
     # Create models directory
@@ -141,82 +153,98 @@ def train_loop(model: nn.Module,
     save_dir = os.path.join("models", timestamp)
     os.makedirs(save_dir, exist_ok=True)
 
+    # 0. Before everything:
+    scaler = GradScaler()
+    best_ssim = 0.0
+
+
     for epoch in range(1, num_epochs + 1):
         model.train()
-        for batch in train_loader:
-            # Extract 'image' and 'label' from the batch dictionary
+        epoch_loss = 0.0
+
+        train_bar = tqdm(train_loader, desc=f"Train Epoch {epoch}/{num_epochs}", leave=False)
+        for batch in train_bar:
             lr_imgs = batch['image'].to(device)
             hr_imgs = batch['label'].to(device)
 
             optimizer.zero_grad()
-            sr = model(lr_imgs)
-            loss = criterion(sr, hr_imgs)
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
+
+            # 1. Mixed-precision forward + loss
+            with autocast():
+                sr = model(lr_imgs)
+                loss = criterion(sr, hr_imgs)
+
+            # 2. Scale, backprop, unscale, clip, step
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+
+            batch_loss = loss.item()
+            epoch_loss += batch_loss
+            train_bar.set_postfix(loss=f"{batch_loss:.4f}")
+
+        scheduler.step()
+        avg_train_loss = epoch_loss / len(train_loader)
 
         # Validation
         model.eval()
+        epoch_psnr, epoch_ssim, epoch_rmse, epoch_pcc = [], [], [], []
+        val_bar = tqdm(val_loader, desc=f"Val Epoch {epoch}/{num_epochs}", leave=False)
+
         with torch.no_grad():
-            epoch_psnr = []
-            epoch_ssim = []
-            epoch_rmse = []
-            epoch_pcc = []
-            for batch in val_loader:
+            for batch in val_bar:
                 lr_imgs = batch['image'].to(device)
                 hr_imgs = batch['label'].to(device)
-                sr = model(lr_imgs)
-                epoch_psnr.append(compute_psnr(sr, hr_imgs))
-                epoch_ssim.append(compute_ssim(sr, hr_imgs))
-                epoch_rmse.append(compute_rmse(sr, hr_imgs))
-                epoch_pcc.append(compute_pcc(sr, hr_imgs))
-            # average metrics for epoch
-            psnr_list.append(np.mean(epoch_psnr))
-            ssim_list.append(np.mean(epoch_ssim))
-            rmse_list.append(np.mean(epoch_rmse))
-            pcc_list.append(np.mean(epoch_pcc))
 
-        # Save model every 10 epochs
+                # 3. You can also wrap inference in autocast for speed
+                with autocast():
+                    sr = model(lr_imgs)
+
+                psnr = compute_psnr(sr, hr_imgs)
+                ssim = (compute_ssim(sr, hr_imgs) + 1) / 2
+                rmse = compute_rmse(sr, hr_imgs)
+                pcc = compute_pcc(sr, hr_imgs)
+
+                epoch_psnr.append(psnr)
+                epoch_ssim.append(ssim)
+                epoch_rmse.append(rmse)
+                epoch_pcc.append(pcc)
+
+                val_bar.set_postfix(PSNR=f"{psnr:.2f}", SSIM=f"{ssim:.4f}")
+
+        # Average metrics
+        avg_psnr = np.mean(epoch_psnr)
+        avg_ssim = np.mean(epoch_ssim)
+        avg_rmse = np.mean(epoch_rmse)
+        avg_pcc = np.mean(epoch_pcc)
+
+        psnr_list.append(avg_psnr)
+        ssim_list.append(avg_ssim)
+        rmse_list.append(avg_rmse)
+        pcc_list.append(avg_pcc)
+
+        print(f"Epoch {epoch}/{num_epochs}  "
+            f"Loss: {avg_train_loss:.4f}  "
+            f"PSNR: {avg_psnr:.4f}  "
+            f"SSIM: {avg_ssim:.4f}  "
+            f"RMSE: {avg_rmse:.4f}  "
+            f"PCC: {avg_pcc:.4f}")
+
+        # 4. Checkpoint on best SSIM (optional) & periodic saves
+        if avg_ssim > best_ssim:
+            best_ssim = avg_ssim
+            torch.save(model.state_dict(), os.path.join(save_dir, "best_ssim.pth"))
+
         if epoch % 10 == 0:
-            model_path = os.path.join(save_dir, f"model_epoch{epoch}.pth")
-            torch.save(model.state_dict(), model_path)
-
-        print(f"Epoch {epoch}/{num_epochs}  PSNR: {psnr_list[-1]:.4f}  SSIM: {ssim_list[-1]:.4f}  RMSE: {rmse_list[-1]:.4f}  PCC: {pcc_list[-1]:.4f}")
+            torch.save(model.state_dict(), os.path.join(save_dir, f"model_epoch{epoch}.pth"))
 
     # After training, save metrics arrays
     metrics = np.vstack([psnr_list, ssim_list, rmse_list, pcc_list]).T
     metrics_path = os.path.join(save_dir, "metrics.txt")
     np.savetxt(metrics_path, metrics, header="PSNR SSIM RMSE PCC", fmt="%.6f")
 
-    # Plot and save each metric
-    epochs = np.arange(1, num_epochs + 1)
-    plt.figure()
-    plt.plot(epochs, psnr_list)
-    plt.title("Validation PSNR over Epochs")
-    plt.xlabel("Epoch")
-    plt.ylabel("PSNR")
-    plt.savefig(os.path.join(save_dir, "psnr_plot.png"))
-
-    plt.figure()
-    plt.plot(epochs, ssim_list)
-    plt.title("Validation SSIM over Epochs")
-    plt.xlabel("Epoch")
-    plt.ylabel("SSIM")
-    plt.savefig(os.path.join(save_dir, "ssim_plot.png"))
-
-    plt.figure()
-    plt.plot(epochs, rmse_list)
-    plt.title("Validation RMSE over Epochs")
-    plt.xlabel("Epoch")
-    plt.ylabel("RMSE")
-    plt.savefig(os.path.join(save_dir, "rmse_plot.png"))
-
-    plt.figure()
-    plt.plot(epochs, pcc_list)
-    plt.title("Validation PCC over Epochs")
-    plt.xlabel("Epoch")
-    plt.ylabel("PCC")
-    plt.savefig(os.path.join(save_dir, "pcc_plot.png"))
     # Plot and save each metric
     epochs = np.arange(1, num_epochs + 1)
     plt.figure()

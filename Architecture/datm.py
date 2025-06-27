@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
-
+from timm.models.layers import DropPath
 
 class AxialWindowAttention(nn.Module):
     """
@@ -92,11 +92,19 @@ class DualAttentionTransformerModule(nn.Module):
                  num_heads: int,
                  window_size: tuple[int,int] = (8,8),
                  mlp_ratio: float = 4.0,
-                 bias: bool = False):
+                 bias: bool = False,
+                 drop_path: float = 0.0):
+        
         super().__init__()
+
+
         self.norm1 = nn.LayerNorm(dim)
         self.axial_attn = AxialWindowAttention(dim, num_heads, window_size, bias=bias)
         self.sgca = SimpleGlobalChannelAttention(dim, reduction=8, bias=bias)
+
+        self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+
         self.norm2 = nn.LayerNorm(dim)
         hidden_dim = int(dim * mlp_ratio)
         self.mlp = nn.Sequential(
@@ -104,20 +112,15 @@ class DualAttentionTransformerModule(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, dim, bias=bias)
         )
+        self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, H, W)
-        B, C, H, W = x.shape
-        # 1) Pre-norm & axial-window attention
-        x0 = x
-        x_ln = self.norm1(x.permute(0,2,3,1)).flatten(1,2)            # (B, N, C)
-        x_attn = self.axial_attn(x0)                                  # (B, C, H, W)
-        x_attn = self.sgca(x_attn)                                    # SGCA scaling on V
-        x1 = x_attn + x0                                              # residual :contentReference[oaicite:13]{index=13}
+        x_attn = self.axial_attn(self.norm1(x.permute(0,2,3,1)).flatten(1,2).view_as(x))
+        x_attn = self.sgca(x_attn)
+        x = x + self.drop_path1(x_attn)
 
-        # 2) Pre-norm & FFN
-        x_ln2 = self.norm2(x1.permute(0,2,3,1)).flatten(1,2)          # (B, N, C)
-        x_mlp = self.mlp(x_ln2).view(B, H, W, C).permute(0,3,1,2)      # back to (B, C, H, W)
-        x2 = x_mlp + x1                                               # residual :contentReference[oaicite:14]{index=14}
-
-        return x2
+        # 2) MLP + residual with stochastic depth
+        x_mlp = self.mlp(self.norm2(x.permute(0,2,3,1)).flatten(1,2)).view_as(x)
+        x = x + self.drop_path2(x_mlp)
+        return x

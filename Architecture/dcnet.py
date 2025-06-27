@@ -1,3 +1,4 @@
+
 # dcnet.py
 
 import torch
@@ -7,29 +8,22 @@ from residual_group import ResidualGroup
 from reconstruction import ProgressiveReconstruction
 
 class DCNet(nn.Module):
-    """
-    Full DCNet:
-      1) ShallowFeatureExtractor → F_0
-      2) N ResidualGroups (RG1…RGN) → F_N
-      3) Global 3×3 conv + add: F_out = Conv3x3(F_N) + F_0
-      4) ProgressiveReconstruction → HR image
-
-    Matches Eq. (3) and Fig. 2 of the paper.
-    """
-    def __init__(self,
-                 in_channels: int = 1,
-                 channels: int = 180,
-                 rg_depths: list[int] = [2,2,2,2,2],
-                 num_heads: list[int] = [6,6,6,6,6],
-                 mlp_ratio: float = 2.0,
-                 window_size: tuple[int,int] = (8,8),
-                 fusion_bias: bool = False,
-                 conv_bias: bool = False,
-                 scale_factors: list[int] = [2,2],
-                 out_channels: int = 1):
+    def __init__(
+        self,
+        in_channels: int = 1,
+        channels: int = 180,
+        rg_depths: list[int] = [2,2,2,2,2],
+        num_heads: list[int] = [6,6,6,6,6],
+        mlp_ratio: float = 2.0,
+        window_size: tuple[int,int] = (8,8),
+        fusion_bias: bool = False,
+        conv_bias: bool = False,
+        scale_factors: list[int] = [2,2],
+        out_channels: int = 1,
+        max_drop_path: float = 0.1,     # <— new!
+    ):
         super().__init__()
-
-        # 1) Shallow feature extraction
+        # 1) Shallow feature extractor
         self.shallow = ShallowFeatureExtractor(
             in_channels=in_channels,
             dim=channels,
@@ -37,10 +31,16 @@ class DCNet(nn.Module):
             bias=conv_bias
         )
 
-        # 2) Stack of Residual Groups
-        assert len(rg_depths) == len(num_heads), "rg_depths and num_heads must align"
+        # 2) Stochastic‐depth schedule
+        total_blocks = sum(rg_depths)
+        dp_rates = torch.linspace(0.0, max_drop_path, total_blocks).tolist()
+
+        # 3) ResidualGroups with per-block drop rates
         self.rgs = nn.ModuleList()
+        idx = 0
         for n_blocks, heads in zip(rg_depths, num_heads):
+            rates = dp_rates[idx: idx + n_blocks]
+            idx += n_blocks
             self.rgs.append(
                 ResidualGroup(
                     channels=channels,
@@ -49,15 +49,14 @@ class DCNet(nn.Module):
                     mlp_ratio=mlp_ratio,
                     window_size=window_size,
                     fusion_bias=fusion_bias,
-                    conv_bias=conv_bias
+                    conv_bias=conv_bias,
+                    drop_path_rates=rates,
                 )
             )
 
-        # 3) Global residual conv
-        self.conv_after_rg = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=conv_bias)
-
-        # 4) Reconstruction head
-        self.reconstruction = ProgressiveReconstruction(
+        # 4) Global residual conv + reconstruction
+        self.conv_after_rg    = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=conv_bias)
+        self.reconstruction   = ProgressiveReconstruction(
             dim=channels,
             scale_factors=scale_factors,
             out_channels=out_channels,
@@ -65,18 +64,11 @@ class DCNet(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Shallow features
         f0 = self.shallow(x)
-
-        # Deep features via RGs
         out = f0
         for rg in self.rgs:
             out = rg(out)
-
-        # Global residual
         out = self.conv_after_rg(out) + f0
-
-        # Upsample to HR
         return self.reconstruction(out)
 
 
